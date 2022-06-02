@@ -29,7 +29,8 @@
 #include "utility.h"
 
 
-class ImageProjection{
+class ImageProjection:public ParamServer
+{
 private:
 
     ros::NodeHandle nh;
@@ -58,6 +59,7 @@ private:
     PointType nanPoint;
 
     cv::Mat rangeMat;
+    cv::Mat imDepth;
     cv::Mat labelMat;
     cv::Mat groundMat;
     int labelCount;
@@ -76,11 +78,12 @@ private:
     uint16_t *queueIndX;
     uint16_t *queueIndY;
 
+    cv_bridge::CvImageConstPtr cv_ptrD;
 public:
     ImageProjection():
         nh("~"){
         // 订阅来自velodyne雷达驱动的topic ("/velodyne_points")
-        subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_points", 1, &ImageProjection::cloudHandler, this);
+        subLaserCloud = nh.subscribe<sensor_msgs::Image>(pointCloudTopic, 1, &ImageProjection::cloudHandler, this);
         
         pubFullCloud = nh.advertise<sensor_msgs::PointCloud2> ("/full_cloud_projected", 1);
         pubFullInfoCloud = nh.advertise<sensor_msgs::PointCloud2> ("/full_cloud_info", 1);
@@ -163,11 +166,11 @@ public:
         pcl::fromROSMsg(*laserCloudMsg, *laserCloudIn);
     }
     
-    void cloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg){
+    void cloudHandler(const sensor_msgs::ImageConstPtr &msgD){
 
-        copyPointCloud(laserCloudMsg);
-        findStartEndAngle();
-        projectPointCloud();
+//        copyPointCloud(laserCloudMsg);
+//        findStartEndAngle();
+        projectPointCloud(msgD);
         groundRemoval();
         cloudSegmentation();
         publishCloud();
@@ -200,100 +203,137 @@ public:
         segMsg.orientationDiff = segMsg.endOrientation - segMsg.startOrientation;
     }
 
-    void projectPointCloud(){
-        float verticalAngle, horizonAngle, range;
-        size_t rowIdn, columnIdn, index, cloudSize; 
+    void projectPointCloud(const sensor_msgs::ImageConstPtr &msgD){
+        cloudHeader.stamp = msgD->header.stamp;
+
+        float  range;//verticalAngle, horizonAngle,
+        size_t index;//rowIdn, columnIdn, cloudSize;
         PointType thisPoint;
-
-        cloudSize = laserCloudIn->points.size();
-
-        for (size_t i = 0; i < cloudSize; ++i){
-
-            thisPoint.x = laserCloudIn->points[i].x;
-            thisPoint.y = laserCloudIn->points[i].y;
-            thisPoint.z = laserCloudIn->points[i].z;
-
-            // 计算竖直方向上的角度（雷达的第几线）
-            verticalAngle = atan2(thisPoint.z, sqrt(thisPoint.x * thisPoint.x + thisPoint.y * thisPoint.y)) * 180 / M_PI;
-			
-            // rowIdn计算出该点激光雷达是竖直方向上第几线的
-			// 从下往上计数，-15度记为初始线，第0线，一共16线(N_SCAN=16)
-            rowIdn = (verticalAngle + ang_bottom) / ang_res_y;
-            if (rowIdn < 0 || rowIdn >= N_SCAN)
-                continue;
-
-            // atan2(y,x)函数的返回值范围(-PI,PI],表示与复数x+yi的幅角
-            // 下方角度atan2(..)交换了x和y的位置，计算的是与y轴正方向的夹角大小(关于y=x做对称变换)
-            // 这里是在雷达坐标系，所以是与正前方的夹角大小
-            horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
-
-			// round函数进行四舍五入取整
-			// 这边确定不是减去180度???  不是
-			// 雷达水平方向上某个角度和水平第几线的关联关系???关系如下：
-			// horizonAngle:(-PI,PI],columnIdn:[H/4,5H/4]-->[0,H] (H:Horizon_SCAN)
-			// 下面是把坐标系绕z轴旋转,对columnIdn进行线性变换
-			// x+==>Horizon_SCAN/2,x-==>Horizon_SCAN
-			// y+==>Horizon_SCAN*3/4,y-==>Horizon_SCAN*5/4,Horizon_SCAN/4
-            //
-            //          3/4*H
-            //          | y+
-            //          |
-            // (x-)H---------->H/2 (x+)
-            //          |
-            //          | y-
-            //    5/4*H   H/4
-            //
-            columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
-            if (columnIdn >= Horizon_SCAN)
-                columnIdn -= Horizon_SCAN;
-            // 经过上面columnIdn -= Horizon_SCAN的变换后的columnIdn分布：
-            //          3/4*H
-            //          | y+
-            //     H    |
-            // (x-)---------->H/2 (x+)
-            //     0    |
-            //          | y-
-            //         H/4
-            //
-            if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
-                continue;
-
-            range = sqrt(thisPoint.x * thisPoint.x + thisPoint.y * thisPoint.y + thisPoint.z * thisPoint.z);
-            rangeMat.at<float>(rowIdn, columnIdn) = range;
-
-			// columnIdn:[0,H] (H:Horizon_SCAN)==>[0,1800]
-            thisPoint.intensity = (float)rowIdn + (float)columnIdn / 10000.0;
-
-            index = columnIdn  + rowIdn * Horizon_SCAN;
-            fullCloud->points[index] = thisPoint;
-
-            fullInfoCloud->points[index].intensity = range;
+        try {
+            cv_ptrD = cv_bridge::toCvShare(msgD);
         }
+        catch (cv_bridge::Exception &e) {
+            ROS_ERROR("cv_bridge exception: %s", e.what());
+            return;
+        }
+        imDepth = cv_ptrD->image;
+        if ((fabs(depthFactor - 1.0f) > 1e-5) || imDepth.type() != CV_32F)
+            imDepth.convertTo(imDepth, CV_32F, 1.0f / depthFactor);
+        for (auto i = 0; i < N_SCAN; i += 1) {
+            for (auto j = 0; j < Horizon_SCAN; j += 1) {
+                thisPoint.x = imDepth.at<float>(i, j);
+                thisPoint.y = -thisPoint.x * (j - ppx) / fx;
+                thisPoint.z = -thisPoint.x * (i - ppy) / fy;
+                range = sqrt(thisPoint.x * thisPoint.x + thisPoint.y * thisPoint.y + thisPoint.z * thisPoint.z);
+                thisPoint.intensity = (float)i + (float)j / 10000.0;
+                if (range < lidarMinRange ||
+                    range > lidarMaxRange)//the point useless have been deleted in (range < RGBDMinRange)
+                    continue;
+                rangeMat.at<float>(i, j) = range;
+                // 保存这个点的坐标
+                index = j + i * Horizon_SCAN;
+                fullCloud->points[index] = thisPoint;
+                fullInfoCloud->points[index].intensity = range;
+            }
+        }
+        // cloudSize = laserCloudIn->points.size();
+
+        // for (size_t i = 0; i < cloudSize; ++i){
+
+        //     thisPoint.x = laserCloudIn->points[i].x;
+        //     thisPoint.y = laserCloudIn->points[i].y;
+        //     thisPoint.z = laserCloudIn->points[i].z;
+
+        //     // 计算竖直方向上的角度（雷达的第几线）
+        //     verticalAngle = atan2(thisPoint.z, sqrt(thisPoint.x * thisPoint.x + thisPoint.y * thisPoint.y)) * 180 / M_PI;
+			
+        //     // rowIdn计算出该点激光雷达是竖直方向上第几线的
+		// 	// 从下往上计数，-15度记为初始线，第0线，一共16线(N_SCAN=16)
+        //     rowIdn = (verticalAngle + ang_bottom) / ang_res_y;
+        //     if (rowIdn < 0 || rowIdn >= N_SCAN)
+        //         continue;
+
+        //     // atan2(y,x)函数的返回值范围(-PI,PI],表示与复数x+yi的幅角
+        //     // 下方角度atan2(..)交换了x和y的位置，计算的是与y轴正方向的夹角大小(关于y=x做对称变换)
+        //     // 这里是在雷达坐标系，所以是与正前方的夹角大小
+        //     horizonAngle = atan2(thisPoint.x, thisPoint.y) * 180 / M_PI;
+
+		// 	// round函数进行四舍五入取整
+		// 	// 这边确定不是减去180度???  不是
+		// 	// 雷达水平方向上某个角度和水平第几线的关联关系???关系如下：
+		// 	// horizonAngle:(-PI,PI],columnIdn:[H/4,5H/4]-->[0,H] (H:Horizon_SCAN)
+		// 	// 下面是把坐标系绕z轴旋转,对columnIdn进行线性变换
+		// 	// x+==>Horizon_SCAN/2,x-==>Horizon_SCAN
+		// 	// y+==>Horizon_SCAN*3/4,y-==>Horizon_SCAN*5/4,Horizon_SCAN/4
+        //     //
+        //     //          3/4*H
+        //     //          | y+
+        //     //          |
+        //     // (x-)H---------->H/2 (x+)
+        //     //          |
+        //     //          | y-
+        //     //    5/4*H   H/4
+        //     //
+        //     columnIdn = -round((horizonAngle-90.0)/ang_res_x) + Horizon_SCAN/2;
+        //     if (columnIdn >= Horizon_SCAN)
+        //         columnIdn -= Horizon_SCAN;
+        //     // 经过上面columnIdn -= Horizon_SCAN的变换后的columnIdn分布：
+        //     //          3/4*H
+        //     //          | y+
+        //     //     H    |
+        //     // (x-)---------->H/2 (x+)
+        //     //     0    |
+        //     //          | y-
+        //     //         H/4
+        //     //
+        //     if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
+        //         continue;
+
+        //     range = sqrt(thisPoint.x * thisPoint.x + thisPoint.y * thisPoint.y + thisPoint.z * thisPoint.z);
+        //     rangeMat.at<float>(rowIdn, columnIdn) = range;
+
+		// 	// columnIdn:[0,H] (H:Horizon_SCAN)==>[0,1800]
+        //     thisPoint.intensity = (float)rowIdn + (float)columnIdn / 10000.0;
+
+        //     index = columnIdn  + rowIdn * Horizon_SCAN;
+        //     fullCloud->points[index] = thisPoint;
+
+        //     fullInfoCloud->points[index].intensity = range;
+        // }
     }
 
 
     void groundRemoval(){
-        size_t lowerInd, upperInd;
+        size_t lowerInd, upperInd,groundCnt=0;
         float diffX, diffY, diffZ, angle;
 
         for (size_t j = 0; j < Horizon_SCAN; ++j){
             // groundScanInd 是在 utility.h 文件中声明的线数，groundScanInd=7
-            for (size_t i = 0; i < groundScanInd; ++i){
+            for (size_t i = groundScanInd; i < N_SCAN; ++i){
 
-                lowerInd = j + ( i )*Horizon_SCAN;
-                upperInd = j + (i+1)*Horizon_SCAN;
-
+//                upperInd = j + ( i )*Horizon_SCAN;
+//                lowerInd = j + (i+5)*Horizon_SCAN;
+                int idx = j + ( i )*Horizon_SCAN;
+                if(fullCloud->points[idx].z<-cameraHeight-groundTh||
+                fullCloud->points[idx].z>-cameraHeight+groundTh)
+                {
+                    continue;
+                }
                 // 初始化的时候用nanPoint.intensity = -1 填充
                 // 都是-1 证明是空点nanPoint
-                if (fullCloud->points[lowerInd].intensity == -1 ||
-                    fullCloud->points[upperInd].intensity == -1){
+                if (fullCloud->points[idx].intensity == -1 ||
+                    fullCloud->points[idx].intensity == -1){
                     groundMat.at<int8_t>(i,j) = -1;
                     continue;
                 }
+                groundMat.at<int8_t>(i,j) = 1;
+                groundCnt++;
 
 				// 由上下两线之间点的XYZ位置得到两线之间的俯仰角
 				// 如果俯仰角在10度以内，则判定(i,j)为地面点,groundMat[i][j]=1
 				// 否则，则不是地面点，进行后续操作
+/*
+
                 diffX = fullCloud->points[upperInd].x - fullCloud->points[lowerInd].x;
                 diffY = fullCloud->points[upperInd].y - fullCloud->points[lowerInd].y;
                 diffZ = fullCloud->points[upperInd].z - fullCloud->points[lowerInd].z;
@@ -303,10 +343,10 @@ public:
                 if (abs(angle - sensorMountAngle) <= 10){
                     groundMat.at<int8_t>(i,j) = 1;
                     groundMat.at<int8_t>(i+1,j) = 1;
-                }
+                }*/ //rgbd相机无法用这个判断地面点
             }
         }
-
+//        std::cout<<"地面点个数： "<<groundCnt<<endl;
 		// 找到所有点中的地面点或者距离为FLT_MAX(rangeMat的初始值)的点，并将他们标记为-1
 		// rangeMat[i][j]==FLT_MAX，代表的含义是什么？ 无效点
         for (size_t i = 0; i < N_SCAN; ++i){
@@ -364,7 +404,7 @@ public:
                     
 					// 如果是地面点,对于列数不为5的倍数的，直接跳过不处理
                     if (groundMat.at<int8_t>(i,j) == 1){
-                        if (j%5!=0 && j>5 && j<Horizon_SCAN-5)
+                        if (j%5!=0 && j>5 && j<Horizon_SCAN-5&& i%5!=0&& i>5 && i<N_SCAN-5)
                             continue;
                     }
 					// 上面多个if语句已经去掉了不符合条件的点，这部分直接进行信息的拷贝和保存操作
@@ -398,8 +438,9 @@ public:
 
     void labelComponents(int row, int col){
         float d1, d2, alpha, angle;
+        float diff;
         int fromIndX, fromIndY, thisIndX, thisIndY; 
-        bool lineCountFlag[N_SCAN] = {false};
+//        bool lineCountFlag[N_SCAN] = {false};
 
         queueIndX[0] = row;
         queueIndY[0] = col;
@@ -429,14 +470,14 @@ public:
                 thisIndX = fromIndX + (*iter).first;
                 thisIndY = fromIndY + (*iter).second;
 
-                if (thisIndX < 0 || thisIndX >= N_SCAN)
+                if (thisIndX < 0 || thisIndX >= N_SCAN||thisIndY < 0||thisIndY >= Horizon_SCAN)
                     continue;
 
-                // 是个环状的图片，左右连通
-                if (thisIndY < 0)
-                    thisIndY = Horizon_SCAN - 1;
-                if (thisIndY >= Horizon_SCAN)
-                    thisIndY = 0;
+//                // 是个环状的图片，左右连通
+//                if (thisIndY < 0)
+//                    thisIndY = Horizon_SCAN - 1;
+//                if (thisIndY >= Horizon_SCAN)
+//                    thisIndY = 0;
 
 				// 如果点[thisIndX,thisIndY]已经标记过
 				// labelMat中，-1代表无效点，0代表未进行标记过，其余为其他的标记
@@ -444,34 +485,36 @@ public:
 				// 如果labelMat已经标记为正整数，则已经聚类完成，不需要再次对该点聚类
                 if (labelMat.at<int>(thisIndX, thisIndY) != 0)
                     continue;
-
-                d1 = std::max(rangeMat.at<float>(fromIndX, fromIndY), 
-                              rangeMat.at<float>(thisIndX, thisIndY));
-                d2 = std::min(rangeMat.at<float>(fromIndX, fromIndY), 
-                              rangeMat.at<float>(thisIndX, thisIndY));
+                // 因为此处使用深度相机，用角度不太合适。选择使用距离聚类。判断深度值变化。
+                diff = abs(imDepth.at<float>(fromIndX, fromIndY)-
+                                   imDepth.at<float>(thisIndX, thisIndY));
+//                d1 = std::max(rangeMat.at<float>(fromIndX, fromIndY),
+//                              rangeMat.at<float>(thisIndX, thisIndY));
+//                d2 = std::min(rangeMat.at<float>(fromIndX, fromIndY),
+//                              rangeMat.at<float>(thisIndX, thisIndY));
 
 				// alpha代表角度分辨率，
 				// X方向上角度分辨率是segmentAlphaX(rad)
 				// Y方向上角度分辨率是segmentAlphaY(rad)
-                if ((*iter).first == 0)
-                    alpha = segmentAlphaX;
-                else
-                    alpha = segmentAlphaY;
+//                if ((*iter).first == 0)
+//                    alpha = segmentAlphaX;
+//                else
+//                    alpha = segmentAlphaY;
 
 				// 通过下面的公式计算这两点之间是否有平面特征
 				// atan2(y,x)的值越大，d1，d2之间的差距越小,越平坦
-                angle = atan2(d2*sin(alpha), (d1 -d2*cos(alpha)));
+//                angle = atan2(d2*sin(alpha), (d1 -d2*cos(alpha)));
 
-                if (angle > segmentTheta){
+//                if (angle > segmentTheta){
+                if (diff < segmentDiff){
 					// segmentTheta=1.0472<==>60度
 					// 如果算出角度大于60度，则假设这是个平面
                     queueIndX[queueEndInd] = thisIndX;
                     queueIndY[queueEndInd] = thisIndY;
                     ++queueSize;
                     ++queueEndInd;
-
                     labelMat.at<int>(thisIndX, thisIndY) = labelCount;
-                    lineCountFlag[thisIndX] = true;
+//                    lineCountFlag[thisIndX] = true;
 
                     allPushedIndX[allPushedIndSize] = thisIndX;
                     allPushedIndY[allPushedIndSize] = thisIndY;
@@ -486,17 +529,17 @@ public:
 		// 如果聚类超过30个点，直接标记为一个可用聚类，labelCount需要递增
         if (allPushedIndSize >= 30)
             feasibleSegment = true;
-        else if (allPushedIndSize >= segmentValidPointNum){
+/*        else if (allPushedIndSize >= segmentValidPointNum){
 			// 如果聚类点数小于30大于等于5，统计竖直方向上的聚类点数
             int lineCount = 0;
             for (size_t i = 0; i < N_SCAN; ++i)
                 if (lineCountFlag[i] == true)
                     ++lineCount;
 
-			// 竖直方向上超过3个也将它标记为有效聚类
-            if (lineCount >= segmentValidLineNum)
-                feasibleSegment = true;            
-        }
+//			// 竖直方向上超过3个也将它标记为有效聚类
+//            if (lineCount >= segmentValidLineNum)
+//                feasibleSegment = true;
+        }*/
 
         if (feasibleSegment == true){
             ++labelCount;
@@ -512,6 +555,7 @@ public:
     void publishCloud(){
     	// 发布cloud_msgs::cloud_info消息
         segMsg.header = cloudHeader;
+        segMsg.header.frame_id = "base_link";
         pubSegmentedCloudInfo.publish(segMsg);
 
         sensor_msgs::PointCloud2 laserCloudTemp;

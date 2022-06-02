@@ -1,0 +1,10 @@
+.vscode/
+.idea/
+.git/
+/build/
+/devel/
+.catkin_workspace
+cmake-build-debug/
+*.png
+*.gif
+

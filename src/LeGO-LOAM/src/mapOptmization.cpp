@@ -46,7 +46,7 @@
 
 using namespace gtsam;
 
-class mapOptimization{
+class mapOptimization:public ParamServer{
 
 private:
 
